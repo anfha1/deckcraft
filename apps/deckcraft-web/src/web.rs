@@ -55,6 +55,10 @@ pub fn start() {
                     CTX.with(|c| *c.borrow_mut() = Some(cc.egui_ctx.clone()));
                     let queue: PendingQueue = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                     listen(queue.clone());
+                    // The embedder cannot tell when the wasm bridge starts listening: the frame's
+                    // `load` event fires long before the 30 MB wasm boots. Announce it, so a host
+                    // page can send commands immediately instead of guessing a delay.
+                    announce_ready();
                     Ok(Box::new(WebShell { app, inbox, queue }))
                 }),
             )
@@ -86,6 +90,8 @@ struct Pending {
 /// `{type:"deckcraft:result", request, ok, data|error}`.
 const MSG_CMD: &str = "deckcraft:cmd";
 const MSG_RESULT: &str = "deckcraft:result";
+/// Sent once, to the embedding page, the moment the command listener is installed.
+const MSG_READY: &str = "deckcraft:ready";
 
 /// Commands the host page may not drive: anything that would close the tab, download, or start a
 /// second slide show. Everything else goes through `SlideApp::run`.
@@ -143,6 +149,15 @@ fn listen(queue: PendingQueue) {
     handler.forget();
 }
 
+/// Tell the embedding page that commands are accepted from now on. Sent once, after `listen`.
+fn announce_ready() {
+    let Some(window) = web_sys::window() else { return };
+    let target = window.parent().ok().flatten().unwrap_or(window.clone());
+    let msg = js_sys::Object::new();
+    js_sys::Reflect::set(&msg, &wasm_bindgen::JsValue::from_str("type"), &wasm_bindgen::JsValue::from_str(MSG_READY)).ok();
+    target.post_message(&msg, "*").ok();
+}
+
 /// Answer one queued command from `logic`, where the app is `&mut`.
 fn drain(app: &mut SlideApp, queue: &PendingQueue, ctx: &egui::Context) {
     let batch = std::mem::take(&mut *queue.borrow_mut());
@@ -153,8 +168,9 @@ fn drain(app: &mut SlideApp, queue: &PendingQueue, ctx: &egui::Context) {
     // Answer the embedder, not ourselves: a page that frames DeckCraft listens on its own window.
     let target = window.parent().ok().flatten().unwrap_or(window.clone());
     for p in batch {
-        let denied = HOST_DENIED.contains(&p.id.as_str());
-        let result = if denied { Err(format!("command {} is not available to the host page", p.id)) } else { app.run(&p.id, p.params) };
+        // `id` is the page's correlation token, `request` is the command name: dispatch on `request`.
+        let denied = HOST_DENIED.contains(&p.request.as_str());
+        let result = if denied { Err(format!("command {} is not available to the host page", p.request)) } else { app.run(&p.request, p.params) };
         let msg = js_sys::Object::new();
         let set = |k: &str, v: wasm_bindgen::JsValue| js_sys::Reflect::set(&msg, &wasm_bindgen::JsValue::from_str(k), &v).ok();
         set("type", wasm_bindgen::JsValue::from_str(MSG_RESULT));
